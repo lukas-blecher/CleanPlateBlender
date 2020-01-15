@@ -3,7 +3,7 @@ from __future__ import print_function
 from mask_spline import *
 import bpy
 from bpy.types import Operator, Panel, PropertyGroup, WindowManager
-from bpy.props import PointerProperty, StringProperty, IntProperty, FloatProperty, BoolProperty
+from bpy.props import PointerProperty, StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
 import sys
 import cv2
 import torch.nn as nn
@@ -22,19 +22,33 @@ bl_info = {
     'blender': (2, 80, 0),
     'name': 'CleanPlate',
     'category': 'Motion Tracking',
-    'location': 'Masking> Movie Clip Editor > CleanPlate',
+    'location': 'Masking > Movie Clip Editor > CleanPlate',
     'author': 'Lukas Blecher'
 }
 
 
+def mask_name_callback(scene, context):
+    items = []
+    masks = bpy.data.masks
+    for m in masks:
+        mname = m.name
+        items.append((mname, mname, ''))
+    return items
+
+
 class Settings(PropertyGroup):
 
-    maxnum: IntProperty(
-        name="Directions",
-        description="The lower this value is the more points will be created",
-        default=3,
-        min=1,
-        max=5
+    mask_name: EnumProperty(
+        name="Mask",
+        description="Which Mask to use for the inpainting",
+        items=mask_name_callback
+    )
+
+    memevery: IntProperty(
+        name="Mem. every",
+        description="Memorize every nth frame",
+        default=5,
+        min=1
     )
 
     maxlen: IntProperty(
@@ -67,6 +81,8 @@ class Settings(PropertyGroup):
 
 
 class CleanPlateMaker:
+    state = -1
+
     def big_trans(self, inv=False):
         return lambda x: x
 
@@ -109,53 +125,162 @@ class CleanPlateMaker:
             self.ytrans = self.big_trans()
             self.yinvt = self.big_trans()
 
-    def cleanplate(self, context, model, state, movpath):
-        mask = context.space_data.mask
-        settings = context.scene.settings
-        layer = mask.layers.active
-        maskSplines = layer.splines
+    def collect_next_frame(self):
+        self.i += 1
+        ret, frame = self.cap.read()
+        # state finished. return and go to next state
+        if not ret or self.i == self.T:
+            self.cap.release()
+            self.i = -1
+            self.state += 1
+            self.frames = torch.from_numpy(np.transpose(self.frames, (3, 0, 1, 2)).copy()).float()
+            self.holes = torch.from_numpy(np.transpose(self.holes, (3, 0, 1, 2)).copy()).float()
+            self.dists = torch.from_numpy(np.transpose(self.dists, (3, 0, 1, 2)).copy()).float()
+            # remove hole
+            self.frames = self.frames * (1-self.holes) + self.holes*torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1, 1)
+            # valids area
+            self.valids = 1-self.holes
+            # unsqueeze to batch 1
+            self.frames = self.frames.unsqueeze(0)
+            self.holes = self.holes.unsqueeze(0)
+            self.dists = self.dists.unsqueeze(0)
+            self.valids = self.valids.unsqueeze(0)
+            return
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = cv2.resize(frame, dsize=(self.W, self.H), interpolation=cv2.INTER_LINEAR)
+        self.frames[self.i] = np.array(frame)/255
+        raw_mask = np.zeros((self.W, self.H), dtype=np.uint8)
+        maskSplines = self.mask.layers.active.splines
+        for _, maskSpline in enumerate(maskSplines):
+            points = maskSpline.points
+            maskSpline.use_cyclic = True
+            co, lhand, rhand = [], [], []
+            for p in points:
+                # need types to be free as it is the most general type
+                p.handle_left_type = 'FREE'
+                p.handle_right_type = 'FREE'
+                co.append(self.absolute_coord(p.co))
+                lhand.append(self.absolute_coord(p.handle_left))
+                rhand.append(self.absolute_coord(p.handle_right))
+            # collection of coordinates and handles
+            crl = [co, rhand, lhand]
+            # get mask from the point coordinates
+            raw_mask += crl2mask(crl, int(self.hw[0]), int(self.hw[1])).astype(np.uint8)
+        raw_mask = np.clip(raw_mask, 0, 1)
+        raw_mask = cv2.resize(raw_mask, dsize=(self.W, self.H), interpolation=cv2.INTER_NEAREST)
+        raw_mask = cv2.dilate(raw_mask, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)))
+        self.holes[self.i, :, :, 0] = raw_mask.astype(np.float32)
+        # dist
+        self.dists[self.i, :, :, 0] = cv2.distanceTransform(raw_mask, cv2.DIST_L2, maskSize=5)
+        bpy.ops.clip.change_frame(frame=bpy.context.scene.frame_current+1)
+
+    def setup(self, context):
+        proj_dir = paths[-1]
+        if proj_dir == '':
+            raise ValueError('CleanPlateBlender path is empty.')
+
+        # Load Model
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = nn.DataParallel(OPN()).to(device)
+        self.model.load_state_dict(torch.load(os.path.join(proj_dir, 'OPN.pth')), strict=False)
+        self.model.eval()
+
+        self.pp_model = nn.DataParallel(TCN()).to(device)
+        self.pp_model.load_state_dict(torch.load(os.path.join(proj_dir, 'TCN.pth')), strict=False)
+        self.pp_model.eval()
+        #mask = context.space_data.mask
+        self.settings = context.scene.settings
+        self.mask = bpy.data.masks[self.settings.mask_name]
         #co_tot, lhand_tot, rhand_tot = [], [], []
         bpy.ops.clip.change_frame(frame=1)
-        cap = cv2.VideoCapture(movpath)
+        self.cap = cv2.VideoCapture(self.movpath)
         #cap.set(1, framenum-1)
         #T, H, W = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        T, H, W = context.scene.frame_end-context.scene.frame_start, context.scene.render.resolution_y, context.scene.render.resolution_x
+        self.T, self.H, self.W = context.scene.frame_end-context.scene.frame_start, context.scene.render.resolution_y, context.scene.render.resolution_x
 
-        frames = np.empty((T, H, W, 3), dtype=np.float32)
-        holes = np.empty((T, H, W, 1), dtype=np.float32)
-        dists = np.empty((T, H, W, 1), dtype=np.float32)
-        i = -1
-        while cap.isOpened():
-            i += 1
-            ret, frame = cap.read()
-            if not ret or i == T:
-                cap.release()
+        self.frames = np.empty((self.T, self.H, self.W, 3), dtype=np.float32)
+        self.holes = np.empty((self.T, self.H, self.W, 1), dtype=np.float32)
+        self.dists = np.empty((self.T, self.H, self.W, 1), dtype=np.float32)
+        self.i = -1
+        self.state += 1
+
+    def memory_encoding(self):
+        self.comps = torch.zeros_like(self.frames)
+        self.ppeds = torch.zeros_like(self.frames)
+        # memory encoding
+        self.midx = list(range(0, self.T, self.settings.memevery))
+        with torch.no_grad():
+            self.mkey, self.mval, self.mhol = self.model(self.frames[:, :, self.midx], self.valids[:, :, self.midx], self.dists[:, :, self.midx])
+        self.state += 1
+
+    def inpainting(self):
+        self.i += 1
+        f = self.i
+        # memory selection
+        if f in self.midx:
+            ridx = [i for i in range(len(self.midx)) if i != int(f/self.settings.memevery)]
+        else:
+            ridx = list(range(len(self.midx)))
+
+        fkey, fval, fhol = self.mkey[:, :, ridx], self.mval[:, :, ridx], self.mhol[:, :, ridx]
+        # inpainting..
+        for r in range(999):
+            if r == 0:
+                self.comp = self.frames[:, :, f]
+                self.dist = self.dists[:, :, f]
+            with torch.no_grad():
+                self.comp, self.dist = self.model(fkey, fval, fhol, self.comp, self.valids[:, :, f], self.dist)
+            # update
+            self.comp, self.dist = self.comp.detach(), self.dist.detach()
+            if torch.sum(self.dist).item() == 0:
                 break
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, dsize=(W, H), interpolation=cv2.INTER_LINEAR)
-            frames[i] = np.array(frame)/255
-            for _, maskSpline in enumerate(maskSplines):
-                points = maskSpline.points
-                maskSpline.use_cyclic = True
-                co, lhand, rhand = [], [], []
-                for p in points:
-                    # need types to be free as it is the most general type
-                    p.handle_left_type = 'FREE'
-                    p.handle_right_type = 'FREE'
-                    co.append(self.absolute_coord(p.co))
-                    lhand.append(self.absolute_coord(p.handle_left))
-                    rhand.append(self.absolute_coord(p.handle_right))
-                # collection of coordinates and handles
-                crl = [co, rhand, lhand]
-                # get mask from the point coordinates
-                raw_mask = crl2mask(crl, int(self.hw[0]), int(self.hw[1])).astype(np.uint8)
-                raw_mask = cv2.resize(raw_mask, dsize=(W, H), interpolation=cv2.INTER_NEAREST)
-                raw_mask = cv2.dilate(raw_mask, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)))
-                holes[i, :, :, 0] = raw_mask.astype(np.float32)
-                # dist
-                dists[i, :, :, 0] = cv2.distanceTransform(raw_mask, cv2.DIST_L2, maskSize=5)
-            bpy.ops.clip.change_frame(frame=bpy.context.scene.frame_current+1)
-        
+        self.comps[:, :, f] = self.comp
+        if f == self.T - 1:
+            self.i=-1
+            self.state+= 1
+            self.ppeds[:, :, 0] = self.comps[:, :, 0]
+            self.hidden = None
+
+    def postprocess(self):
+        self.i += 1
+        f = self.i
+        with torch.no_grad():
+            self.pped,  self.hidden = self.pp_model(self.ppeds[:, :, f-1], self.holes[:, :, f-1], self.comps[:, :, f], self.holes[:, :, f], self.hidden)
+            self.ppeds[:, :, f] = self.pped
+        if f == self.T - 1:
+            self.i=-1
+            self.state+= 1
+
+    def save(self, context):
+        self.i += 1
+        f = self.i
+        canvas = (self.ppeds[0, :, f].permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)
+        # TODO outpath
+        save_path = os.path.join('Video_results', seq_name)
+        if not os.path.exists(save_path):
+            os.makedirs(save_path)
+        canvas = Image.fromarray(canvas)
+        canvas.save(os.path.join(save_path, '{:05d}.jpg'.format(f+context.scene.frame_start)))
+        if f == self.T - 1:
+            self.i=-1
+            self.state+= 1
+
+    def cleanplate(self, context):
+        if self.state == -1:
+            self.setup(context)
+        elif self.state == 0:
+            self.collect_next_frame()
+        elif self.state == 1:
+            self.memory_encoding()
+        elif self.state == 2:
+            self.inpainting()
+        elif self.state == 3:
+            self.postprocess()
+        elif self.state == 4:
+            self.save(context)
+        elif self.state == 5:
+            return {'FINISHED'}
+
 
 class OBJECT_OT_cleanplate(Operator):
     bl_idname = "object.cleanplate"
@@ -173,12 +298,10 @@ class OBJECT_OT_cleanplate(Operator):
             self._updating = True
             frame_end = context.scene.frame_end
             if bpy.context.scene.frame_current < frame_end-1:
-                ret = self.cpm.cleanplate(context, self.model, self.state, self.cpm.movpath)
+                ret = self.cpm.cleanplate(context)
                 if type(ret) == set:
                     self._calcs_done = True
-                else:
-                    self.model = ret[0]
-                    self.state = ret[1]
+
             self._updating = False
         if self._calcs_done:
             self.cancel(context)
@@ -190,20 +313,7 @@ class OBJECT_OT_cleanplate(Operator):
         self.cpm.movpath = bpy.path.abspath(clip.filepath)
         self.cpm.hw = clip.size
         self.cpm.set_coordinate_transform()
-        proj_dir = paths[-1]
-        if proj_dir == '':
-            raise ValueError('CleanPlateBlender path is empty.')
         
-        # Load Model
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.cpm.model = nn.DataParallel(OPN()).to(device)
-        self.cpm.model.load_state_dict(torch.load(os.path.join(proj_dir, 'OPN.pth')), strict=False)
-        self.cpm.model.eval()
-
-        self.cpm.pp_model = nn.DataParallel(TCN()).to(device)
-        self.cpm.pp_model.load_state_dict(torch.load(os.path.join(proj_dir, 'TCN.pth')), strict=False)
-        self.cpm.pp_model.eval()
-
         self._calcs_done = False
         context.window_manager.modal_handler_add(self)
         self._updating = False
@@ -214,8 +324,7 @@ class OBJECT_OT_cleanplate(Operator):
         if self._timer is not None:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
-            del self.model
-            del self.state
+            del self.cpm
         return {'CANCELLED'}
 
 
@@ -236,24 +345,22 @@ class PANEL0_PT_cleanplate(Panel):
         layout = self.layout
         layout.use_property_split = True  # Active single-column layout
         # track masks operators
-        c = layout.column()
-        row = c.row()
-        split = row.split(factor=0.3)
-        c = split.column()
-        c.label(text="Track:")
-        split = split.split()
-        c = split.row()
-        c.operator("object.cleanplate", icon="TRACKING_FORWARDS")
+        #c = layout.column()
+        #row = c.row()
+        #split = row.split(factor=0.3)
+        #c = split.column()
+        # c.label(text="Track:")
+        #split = split.split()
+        #c = split.row()
+        c.operator("object.cleanplate", text="Create Clean Plate")
         row = layout.column()
-        layout.prop(settings, 'maxlen')
-        layout.prop(settings, 'threshold')
-        layout.prop(settings, 'maxnum')
-        layout.prop(settings, 'change_layer')
+        layout.prop(settings, 'mask_name')
+        layout.prop(settings, 'memevery')
 
         layout.separator()
 
 
-classes = (OBJECT_OT_cleanplate, OBJECT_OT_clear_forwards, OBJECT_OT_clear_backwards, PANEL0_PT_cleanplate, Settings)
+classes = (OBJECT_OT_cleanplate, PANEL0_PT_cleanplate, Settings)
 
 
 def register():
