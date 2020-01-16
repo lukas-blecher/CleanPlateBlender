@@ -15,10 +15,13 @@ for p in paths:
 import cv2
 import torch.nn as nn
 import torch
+from geomdl import BSpline
+from geomdl import utilities
+from PIL import Image, ImageDraw
+import numpy as np
 
 from models.OPN import OPN
 from models.TCN import TCN
-from mask_spline import *
 
 bl_info = {
     'blender': (2, 80, 0),
@@ -79,6 +82,31 @@ class Settings(PropertyGroup):
         description="Change the active Mask Layer according to the frame\nwhen moving the along the timeline",
         default=True
     )
+
+
+def spline2mask(crl, width, height, delta=.05, downscale=1):
+    c, r, l = crl if type(crl) == list else crl.tolist()
+    cps = []
+    for i in range(len(c)):
+        ip = (i+1) % len(c)
+        cps.append([c[i], r[i], l[ip], c[ip]])
+    connecs = []
+    for i in range(len(cps)):
+        curve = BSpline.Curve()
+        curve.degree = 3
+        curve.ctrlpts = cps[i]
+        curve.knotvector = utilities.generate_knot_vector(curve.degree, len(curve.ctrlpts))
+        # print('delta',delta)
+        curve.delta = delta
+        curve.evaluate()
+        connecs.append(curve.evalpts)
+
+    polygon = np.array(connecs).flatten().tolist()
+    img = Image.new('L', (height, width), 255)
+    ImageDraw.Draw(img).polygon(polygon, outline=0, fill=0)
+    mask = np.array(img.resize((int(height//downscale), int(width//downscale)), Image.NEAREST))
+    #print(mask.shape, width, height, downscale,int(width//downscale), int(height//downscale))
+    return mask == False
 
 
 class CleanPlateMaker:
@@ -151,22 +179,25 @@ class CleanPlateMaker:
         frame = cv2.resize(frame, dsize=(self.W, self.H), interpolation=cv2.INTER_LINEAR)
         self.frames[self.i] = np.array(frame)/255
         raw_mask = np.zeros((self.H, self.W), dtype=np.uint8)
-        maskSplines = self.mask.layers.active.splines
-        for _, maskSpline in enumerate(maskSplines):
-            points = maskSpline.points
-            maskSpline.use_cyclic = True
-            co, lhand, rhand = [], [], []
-            for p in points:
-                # need types to be free as it is the most general type
-                p.handle_left_type = 'FREE'
-                p.handle_right_type = 'FREE'
-                co.append(self.absolute_coord(p.co))
-                lhand.append(self.absolute_coord(p.handle_left))
-                rhand.append(self.absolute_coord(p.handle_right))
-            # collection of coordinates and handles
-            crl = [co, rhand, lhand]
-            # get mask from the point coordinates
-            raw_mask += crl2mask(crl, self.hw[1], self.hw[0], downscale=self.settings.downscale).astype(np.uint8)
+        for layer in self.mask.layers:
+            if layer.hide_render:
+                continue
+            maskSplines = layer.splines
+            for _, maskSpline in enumerate(maskSplines):
+                points = maskSpline.points
+                maskSpline.use_cyclic = True
+                co, lhand, rhand = [], [], []
+                for p in points:
+                    # need types to be free as it is the most general type
+                    p.handle_left_type = 'FREE'
+                    p.handle_right_type = 'FREE'
+                    co.append(self.absolute_coord(p.co))
+                    lhand.append(self.absolute_coord(p.handle_left))
+                    rhand.append(self.absolute_coord(p.handle_right))
+                # collection of coordinates and handles
+                crl = [co, rhand, lhand]
+                # get mask from the point coordinates
+                raw_mask += spline2mask(crl, self.hw[1], self.hw[0], downscale=self.settings.downscale).astype(np.uint8)
         raw_mask = np.clip(raw_mask, 0, 1)
         #canvas = Image.fromarray(raw_mask*255)
         raw_mask = cv2.resize(raw_mask, dsize=(self.W, self.H), interpolation=cv2.INTER_NEAREST)
