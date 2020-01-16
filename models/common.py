@@ -3,28 +3,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
-import torch.utils.model_zoo as model_zoo
-from torchvision import models
- 
+
 # general libs
-import cv2
-import matplotlib.pyplot as plt
-from PIL import Image
 import numpy as np
-import math
-import time
-import tqdm
 import os
-import argparse
-import copy
 import sys
 
-sys.path.insert(0, '../utils/')
-from utils.helpers import *
+#directory = os.path.dirname(os.path.realpath(__file__))
+#sys.path.insert(0, os.path.join(os.path.abspath(os.path.join(directory, os.pardir)),'utils'))
+# print(sys.path[0])
+#from utils.helpers import *
 
 ##########################################
 ############   Generic   #################
 ##########################################
+
 
 def pad_divide_by(in_list, d, in_size):
     out_list = []
@@ -58,8 +51,8 @@ class ConvGRU(nn.Module):
         gh = self.convHH(hidden_tm1)
         i_r, i_i, i_n = torch.chunk(gi, 3, dim=1)
         h_r, h_i, h_n = torch.chunk(gh, 3, dim=1)
-        resetgate = torch.sigmoid(i_r + h_r) # reset
-        inputgate = torch.sigmoid(i_i + h_i) # update
+        resetgate = torch.sigmoid(i_r + h_r)  # reset
+        inputgate = torch.sigmoid(i_i + h_i)  # update
         newgate = torch.tanh(i_n + resetgate * h_n)
         # hidden_t = inputgate * hidden_tm1 + (1-inputgate)*newgate
         hidden_t = newgate + inputgate * (hidden_tm1 - newgate)
@@ -70,16 +63,26 @@ def F_upsample3d(x, size=None, scale_factor=None, mode='nearest', align_corners=
     num_frames = x.size()[2]
     up_s = []
     for f in range(num_frames):
-        up = F.interpolate(x[:,:,f], size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners)
+        up = F.interpolate(x[:, :, f], size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners)
         up_s.append(up)
-    ups = torch.stack(up_s, dim=2) 
+    ups = torch.stack(up_s, dim=2)
     return ups
 
+
 def F_upsample(x, size=None, scale_factor=None, mode='nearest', align_corners=None):
-    if x.dim() == 5: # 3d
+    if x.dim() == 5:  # 3d
         return F_upsample3d(x, size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners)
-    else: 
+    else:
         return F.interpolate(x, size=size, scale_factor=scale_factor, mode=mode, align_corners=align_corners)
+
+
+def init_He(module):
+    for m in module.modules():
+        if isinstance(m, nn.Conv2d):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        elif isinstance(m, nn.BatchNorm2d):
+            nn.init.constant_(m.weight, 1)
+            nn.init.constant_(m.bias, 0)
 
 
 class GatedConv2d(nn.Module):
@@ -89,7 +92,7 @@ class GatedConv2d(nn.Module):
         self.input_conv = nn.Conv2d(in_channels, out_channels, kernel_size,
                                     stride, padding, dilation, groups, bias)
         self.gating_conv = nn.Conv2d(in_channels, out_channels, kernel_size,
-                                   stride, padding, dilation, groups, bias)
+                                     stride, padding, dilation, groups, bias)
         init_He(self)
         self.activation = activation
 

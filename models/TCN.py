@@ -3,27 +3,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
-import torch.utils.model_zoo as model_zoo
-from torchvision import models
  
 # general libs
-import cv2
-import matplotlib.pyplot as plt
-from PIL import Image
-import numpy as np
-import math
-import time
-import tqdm
-import os
-import argparse
-import copy
 import sys
-import random
- 
-sys.path.insert(0, '.')
+import os
+directory = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, directory)
 from .common import *
-sys.path.insert(0, '../utils/')
-from utils.helpers import *
  
 class Encoder(nn.Module):
     def __init__(self):

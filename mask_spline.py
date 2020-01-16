@@ -3,7 +3,7 @@ from geomdl import utilities
 from PIL import Image, ImageDraw
 import numpy as np
 
-def bspline2mask(cps, width, height, delta=0.05):
+def bspline2mask(cps, width, height, delta=0.05, downscale=1):
     connecs = []
     for i in range(len(cps)):
         curve = BSpline.Curve()
@@ -16,17 +16,18 @@ def bspline2mask(cps, width, height, delta=0.05):
         connecs.append(curve.evalpts)
 
     polygon = np.array(connecs).flatten().tolist()
-    img = Image.new('L', (width, height), 255)
+    img = Image.new('L', (height, width), 255)
     ImageDraw.Draw(img).polygon(polygon, outline=0, fill=0)
-    mask = np.array(img.resize((width, height), Image.NEAREST))
+    mask = np.array(img.resize((int(height//downscale), int(width//downscale)), Image.NEAREST))
+    #print(mask.shape, width, height, downscale,int(width//downscale), int(height//downscale))
     return mask == False
 
 
-def crl2mask(crl, width, height, delta=.05):
+def crl2mask(crl, width, height, delta=.05, downscale=1):
     c, r, l = crl if type(crl) == list else crl.tolist()
     cps = []
     for i in range(len(c)):
         ip = (i+1) % len(c)
         cps.append([c[i], r[i], l[ip], c[ip]])
-    return bspline2mask(cps, width, height, delta=delta)
+    return bspline2mask(cps, width, height, delta=delta, downscale=downscale)
 

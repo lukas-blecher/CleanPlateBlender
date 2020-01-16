@@ -1,22 +1,24 @@
 
-from __future__ import print_function
-from mask_spline import *
 import bpy
 from bpy.types import Operator, Panel, PropertyGroup, WindowManager
 from bpy.props import PointerProperty, StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
 import sys
-import cv2
-import torch.nn as nn
-import torch
 import os
 paths = [
     r'C:\Users\user\AppData\Local\Continuum\anaconda3\lib\site-packages',
-    r'C:\Users\user\Desktop\ML\CleanPlateBlender'
+    r'C:\Users\user\Desktop\ML\CleanPlateBlender',
+    #os.path.dirname(os.path.realpath(__file__))
 ]
 for p in paths:
     sys.path.insert(0, p)
+
+import cv2
+import torch.nn as nn
+import torch
+
 from models.OPN import OPN
 from models.TCN import TCN
+from mask_spline import *
 
 bl_info = {
     'blender': (2, 80, 0),
@@ -30,9 +32,9 @@ bl_info = {
 def mask_name_callback(scene, context):
     items = []
     masks = bpy.data.masks
-    for m in masks:
+    for i, m in enumerate(masks):
         mname = m.name
-        items.append((mname, mname, ''))
+        items.append((mname, mname, '', 'MOD_MASK', i+1))
     return items
 
 
@@ -51,26 +53,25 @@ class Settings(PropertyGroup):
         min=1
     )
 
-    maxlen: IntProperty(
-        name="Max. Length",
-        description="The maximum amount of pixels a mask line segment is tracing",
-        default=150,
+    outpath: StringProperty(
+        name="Output Directory",
+        description="Where to save the inpainted images",
+        default='/tmp',
+        maxlen=1024,
+        subtype='DIR_PATH'
+    )
+
+    imgending: StringProperty(
+        name="File Format",
+        description="File Format for the inpainted images",
+        default='png'
+    )
+
+    downscale: FloatProperty(
+        name="Downscaling Factor",
+        description="How much to downscale the image",
+        default=1,
         min=1
-    )
-
-    threshold: IntProperty(
-        name="Treshold",
-        description="The amount of points that can point in a different direction\nbefore a new segment is created",
-        default=10,
-        min=0
-    )
-
-    my_float: FloatProperty(
-        name="Float Value",
-        description="A float property",
-        default=23.7,
-        min=0.01,
-        max=30.0
     )
 
     change_layer: BoolProperty(
@@ -149,7 +150,7 @@ class CleanPlateMaker:
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = cv2.resize(frame, dsize=(self.W, self.H), interpolation=cv2.INTER_LINEAR)
         self.frames[self.i] = np.array(frame)/255
-        raw_mask = np.zeros((self.W, self.H), dtype=np.uint8)
+        raw_mask = np.zeros((self.H, self.W), dtype=np.uint8)
         maskSplines = self.mask.layers.active.splines
         for _, maskSpline in enumerate(maskSplines):
             points = maskSpline.points
@@ -165,10 +166,12 @@ class CleanPlateMaker:
             # collection of coordinates and handles
             crl = [co, rhand, lhand]
             # get mask from the point coordinates
-            raw_mask += crl2mask(crl, int(self.hw[0]), int(self.hw[1])).astype(np.uint8)
+            raw_mask += crl2mask(crl, self.hw[1], self.hw[0], downscale=self.settings.downscale).astype(np.uint8)
         raw_mask = np.clip(raw_mask, 0, 1)
+        #canvas = Image.fromarray(raw_mask*255)
         raw_mask = cv2.resize(raw_mask, dsize=(self.W, self.H), interpolation=cv2.INTER_NEAREST)
         raw_mask = cv2.dilate(raw_mask, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)))
+        #canvas.save(os.path.join(self.settings.outpath, '%05dmask.%s'%(self.i, self.settings.imgending)))
         self.holes[self.i, :, :, 0] = raw_mask.astype(np.float32)
         # dist
         self.dists[self.i, :, :, 0] = cv2.distanceTransform(raw_mask, cv2.DIST_L2, maskSize=5)
@@ -179,30 +182,38 @@ class CleanPlateMaker:
         if proj_dir == '':
             raise ValueError('CleanPlateBlender path is empty.')
 
-        # Load Model
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = nn.DataParallel(OPN()).to(device)
-        self.model.load_state_dict(torch.load(os.path.join(proj_dir, 'OPN.pth')), strict=False)
-        self.model.eval()
-
-        self.pp_model = nn.DataParallel(TCN()).to(device)
-        self.pp_model.load_state_dict(torch.load(os.path.join(proj_dir, 'TCN.pth')), strict=False)
-        self.pp_model.eval()
-        #mask = context.space_data.mask
-        self.settings = context.scene.settings
-        self.mask = bpy.data.masks[self.settings.mask_name]
-        #co_tot, lhand_tot, rhand_tot = [], [], []
-        bpy.ops.clip.change_frame(frame=1)
-        self.cap = cv2.VideoCapture(self.movpath)
-        #cap.set(1, framenum-1)
-        #T, H, W = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        self.T, self.H, self.W = context.scene.frame_end-context.scene.frame_start, context.scene.render.resolution_y, context.scene.render.resolution_x
-
+        self.settings = context.scene.cp_settings
+        self.T = context.scene.frame_end-context.scene.frame_start
+        self.W, self.H = self.hw  # context.scene.render.resolution_y, context.scene.render.resolution_x
+        self.W, self.H = int(self.W//self.settings.downscale), int(self.H//self.settings.downscale)
         self.frames = np.empty((self.T, self.H, self.W, 3), dtype=np.float32)
         self.holes = np.empty((self.T, self.H, self.W, 1), dtype=np.float32)
         self.dists = np.empty((self.T, self.H, self.W, 1), dtype=np.float32)
+
+        # progress bar
+        self.progress = 0
+        self.wm = context.window_manager
+        self.wm.progress_begin(0, 2+self.T*4)
+
+        # Load Model
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = nn.DataParallel(OPN()).to(device)
+        self.model.load_state_dict(torch.load(os.path.join(proj_dir, 'weights', 'OPN.pth')), strict=False)
+        self.model.eval()
+
+        self.pp_model = nn.DataParallel(TCN()).to(device)
+        self.pp_model.load_state_dict(torch.load(os.path.join(proj_dir, 'weights', 'TCN.pth')), strict=False)
+        self.pp_model.eval()
+        #mask = context.space_data.mask
+        self.mask = bpy.data.masks[self.settings.mask_name]
+        #co_tot, lhand_tot, rhand_tot = [], [], []
+        bpy.ops.clip.change_frame(frame=context.scene.frame_start)
+        self.cap = cv2.VideoCapture(self.movpath)
+        self.cap.set(1, context.scene.frame_start-1)
+        #T, H, W = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)), int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+
         self.i = -1
-        self.state += 1
+        self.state = 0
 
     def memory_encoding(self):
         self.comps = torch.zeros_like(self.frames)
@@ -236,8 +247,8 @@ class CleanPlateMaker:
                 break
         self.comps[:, :, f] = self.comp
         if f == self.T - 1:
-            self.i=-1
-            self.state+= 1
+            self.i = -1
+            self.state += 1
             self.ppeds[:, :, 0] = self.comps[:, :, 0]
             self.hidden = None
 
@@ -248,22 +259,21 @@ class CleanPlateMaker:
             self.pped,  self.hidden = self.pp_model(self.ppeds[:, :, f-1], self.holes[:, :, f-1], self.comps[:, :, f], self.holes[:, :, f], self.hidden)
             self.ppeds[:, :, f] = self.pped
         if f == self.T - 1:
-            self.i=-1
-            self.state+= 1
+            self.i = -1
+            self.state += 1
 
     def save(self, context):
         self.i += 1
         f = self.i
         canvas = (self.ppeds[0, :, f].permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)
-        # TODO outpath
-        save_path = os.path.join('Video_results', seq_name)
+        save_path = self.settings.outpath
         if not os.path.exists(save_path):
             os.makedirs(save_path)
         canvas = Image.fromarray(canvas)
-        canvas.save(os.path.join(save_path, '{:05d}.jpg'.format(f+context.scene.frame_start)))
+        canvas.save(os.path.join(save_path, '%05d.%s' % (f+context.scene.frame_start, self.settings.imgending)))
         if f == self.T - 1:
-            self.i=-1
-            self.state+= 1
+            self.i = -1
+            self.state += 1
 
     def cleanplate(self, context):
         if self.state == -1:
@@ -279,7 +289,11 @@ class CleanPlateMaker:
         elif self.state == 4:
             self.save(context)
         elif self.state == 5:
+            self.state = -1
+            self.wm.progress_end()
             return {'FINISHED'}
+        self.progress += 1
+        self.wm.progress_update(np.clip(self.progress, 0, 2+self.T*4))
 
 
 class OBJECT_OT_cleanplate(Operator):
@@ -296,11 +310,11 @@ class OBJECT_OT_cleanplate(Operator):
             self._calcs_done = True
         elif event.type == 'TIMER' and not self._updating and not self._calcs_done:
             self._updating = True
-            frame_end = context.scene.frame_end
-            if bpy.context.scene.frame_current < frame_end-1:
-                ret = self.cpm.cleanplate(context)
-                if type(ret) == set:
-                    self._calcs_done = True
+            #frame_end = context.scene.frame_end
+            # if bpy.context.scene.frame_current < frame_end:
+            ret = self.cpm.cleanplate(context)
+            if type(ret) == set:
+                self._calcs_done = True
 
             self._updating = False
         if self._calcs_done:
@@ -313,12 +327,12 @@ class OBJECT_OT_cleanplate(Operator):
         self.cpm.movpath = bpy.path.abspath(clip.filepath)
         self.cpm.hw = clip.size
         self.cpm.set_coordinate_transform()
-        
+
         self._calcs_done = False
         context.window_manager.modal_handler_add(self)
         self._updating = False
         self._timer = context.window_manager.event_timer_add(.01, window=context.window)
-        return {'FINISHED'}
+        return {'RUNNING_MODAL'}
 
     def cancel(self, context):
         if self._timer is not None:
@@ -341,23 +355,17 @@ class PANEL0_PT_cleanplate(Panel):
 
     # Draw UI
     def draw(self, context):
-        settings = context.scene.settings
+        settings = context.scene.cp_settings
         layout = self.layout
         layout.use_property_split = True  # Active single-column layout
-        # track masks operators
-        #c = layout.column()
-        #row = c.row()
-        #split = row.split(factor=0.3)
-        #c = split.column()
-        # c.label(text="Track:")
-        #split = split.split()
-        #c = split.row()
-        c.operator("object.cleanplate", text="Create Clean Plate")
-        row = layout.column()
         layout.prop(settings, 'mask_name')
+        layout.prop(settings, 'downscale')
         layout.prop(settings, 'memevery')
-
+        layout.prop(settings, 'imgending', icon='FILE_IMAGE')
+        layout.prop(settings, 'outpath')
         layout.separator()
+        row = layout.row()
+        row.operator("object.cleanplate", text="Create Clean Plate")
 
 
 classes = (OBJECT_OT_cleanplate, PANEL0_PT_cleanplate, Settings)
@@ -367,14 +375,14 @@ def register():
     from bpy.utils import register_class
     for cls in classes:
         register_class(cls)
-    bpy.types.Scene.settings = PointerProperty(type=Settings)
+    bpy.types.Scene.cp_settings = PointerProperty(type=Settings)
 
 
 def unregister():
     from bpy.utils import unregister_class
     for cls in reversed(classes):
         unregister_class(cls)
-    del bpy.types.Scene.settings
+    del bpy.types.Scene.cp_settings
 
 
 if __name__ == "__main__":
