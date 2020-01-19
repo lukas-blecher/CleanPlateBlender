@@ -3,11 +3,11 @@ import bpy
 from bpy.types import Operator, Panel, PropertyGroup, WindowManager
 from bpy.props import PointerProperty, StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
 import sys
+import tempfile
 import os
 paths = [
-    r'C:\Users\user\AppData\Local\Continuum\anaconda3\lib\site-packages',
-    r'C:\Users\user\Desktop\ML\CleanPlateBlender',
-    #os.path.dirname(os.path.realpath(__file__))
+    #r'PYTHON_PATH',
+    os.path.dirname(os.path.realpath(__file__))
 ]
 for p in paths:
     sys.path.insert(0, p)
@@ -59,7 +59,7 @@ class Settings(PropertyGroup):
     outpath: StringProperty(
         name="Output Directory",
         description="Where to save the inpainted images",
-        default='/tmp',
+        default=tempfile.gettempdir(),
         maxlen=1024,
         subtype='DIR_PATH'
     )
