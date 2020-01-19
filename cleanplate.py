@@ -3,6 +3,7 @@ import bpy
 from bpy.types import Operator, Panel, PropertyGroup, WindowManager
 from bpy.props import PointerProperty, StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
 import sys
+import tempfile
 import os
 paths = [
     r'C:\Users\user\AppData\Local\Continuum\anaconda3\lib\site-packages',
@@ -15,13 +16,16 @@ for p in paths:
 import cv2
 import torch.nn as nn
 import torch
-from geomdl import BSpline
-from geomdl import utilities
+from torch.utils.data import DataLoader
+from geomdl import BSpline, utilities
+import cvbase as cvb
 from PIL import Image, ImageDraw
 import numpy as np
+import dataset
+import models
+import tools
+import utils
 
-from models.OPN import OPN
-from models.TCN import TCN
 
 bl_info = {
     'blender': (2, 80, 0),
@@ -31,6 +35,8 @@ bl_info = {
     'author': 'Lukas Blecher'
 }
 
+class Arguments:
+    LiteFlowNet,DFC,ResNet101=True,True,True
 
 def mask_name_callback(scene, context):
     items = []
@@ -49,17 +55,38 @@ class Settings(PropertyGroup):
         items=mask_name_callback
     )
 
-    memevery: IntProperty(
-        name="Mem. every",
-        description="Memorize every nth frame",
-        default=5,
+    mask_enlarge: IntProperty(
+        name="Enlarge Mask",
+        description="Enlarge the effective mask during inpainting",
+        default=0,
+        min=0
+    )
+
+    n_threads: IntProperty(
+        name="Threads",
+        description="Number of threads",
+        default=8,
+        min=0
+    )
+
+    th_warp: IntProperty(
+        name="Threshold",
+        description="Threshold in the propagation process",
+        default=40,
+        min=1
+    )
+
+    batch_size: IntProperty(
+        name="Batch size",
+        description="How many frames to process at once\n (depends heavily on the GPU)",
+        default=1,
         min=1
     )
 
     outpath: StringProperty(
         name="Output Directory",
         description="Where to save the inpainted images",
-        default='/tmp',
+        default=tempfile.gettempdir(),
         maxlen=1024,
         subtype='DIR_PATH'
     )
@@ -157,27 +184,17 @@ class CleanPlateMaker:
     def collect_next_frame(self):
         self.i += 1
         ret, frame = self.cap.read()
+        curr_frame = bpy.context.scene.frame_current
         # state finished. return and go to next state
         if not ret or self.i == self.T:
             self.cap.release()
             self.i = -1
             self.state += 1
-            self.frames = torch.from_numpy(np.transpose(self.frames, (3, 0, 1, 2)).copy()).float()
-            self.holes = torch.from_numpy(np.transpose(self.holes, (3, 0, 1, 2)).copy()).float()
-            self.dists = torch.from_numpy(np.transpose(self.dists, (3, 0, 1, 2)).copy()).float()
-            # remove hole
-            self.frames = self.frames * (1-self.holes) + self.holes*torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1, 1)
-            # valids area
-            self.valids = 1-self.holes
-            # unsqueeze to batch 1
-            self.frames = self.frames.unsqueeze(0)
-            self.holes = self.holes.unsqueeze(0)
-            self.dists = self.dists.unsqueeze(0)
-            self.valids = self.valids.unsqueeze(0)
             return
-        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        #frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         frame = cv2.resize(frame, dsize=(self.W, self.H), interpolation=cv2.INTER_LINEAR)
-        self.frames[self.i] = np.array(frame)/255
+        cv2.imwrite(os.path.join(self.args.img_root,'%05d.%s'%(curr_frame, self.settings.imgending)),frame)
+        #self.frames[self.i] = np.array(frame)/255
         raw_mask = np.zeros((self.H, self.W), dtype=np.uint8)
         for layer in self.mask.layers:
             if layer.hide_render:
@@ -199,14 +216,11 @@ class CleanPlateMaker:
                 # get mask from the point coordinates
                 raw_mask += spline2mask(crl, self.hw[1], self.hw[0], downscale=self.settings.downscale).astype(np.uint8)
         raw_mask = np.clip(raw_mask, 0, 1)
-        #canvas = Image.fromarray(raw_mask*255)
-        raw_mask = cv2.resize(raw_mask, dsize=(self.W, self.H), interpolation=cv2.INTER_NEAREST)
-        raw_mask = cv2.dilate(raw_mask, cv2.getStructuringElement(cv2.MORPH_CROSS, (3, 3)))
+        
+        Image.fromarray(raw_mask*255).resize(self.W, self.H, Image.BILINEAR).save(os.path.join(self.args.mask_root,'%05d.png'%curr_frame))
         #canvas.save(os.path.join(self.settings.outpath, '%05dmask.%s'%(self.i, self.settings.imgending)))
-        self.holes[self.i, :, :, 0] = raw_mask.astype(np.float32)
-        # dist
-        self.dists[self.i, :, :, 0] = cv2.distanceTransform(raw_mask, cv2.DIST_L2, maskSize=5)
-        bpy.ops.clip.change_frame(frame=bpy.context.scene.frame_current+1)
+        
+        bpy.ops.clip.change_frame(frame=curr_frame+1)
 
     def setup(self, context):
         proj_dir = paths[-1]
@@ -215,26 +229,42 @@ class CleanPlateMaker:
 
         self.settings = context.scene.cp_settings
         self.T = context.scene.frame_end-context.scene.frame_start
+        assert self.T >= 12, 'At least 12 frames are required'
         self.W, self.H = self.hw  # context.scene.render.resolution_y, context.scene.render.resolution_x
         self.W, self.H = int(self.W//self.settings.downscale), int(self.H//self.settings.downscale)
-        self.frames = np.empty((self.T, self.H, self.W, 3), dtype=np.float32)
-        self.holes = np.empty((self.T, self.H, self.W, 1), dtype=np.float32)
-        self.dists = np.empty((self.T, self.H, self.W, 1), dtype=np.float32)
 
         # progress bar
         self.progress = 0
         self.wm = context.window_manager
         self.wm.progress_begin(0, 2+self.T*4)
 
+        # create temporary directory
+        self.tmp_dir = tempfile.TemporaryDirectory()
+
+        # save Arguments
+        self.args=Arguments()
+        self.args.img_root=os.path.join(self.tmp_dir.name,'frames')
+        self.args.mask_root=os.path.join(self.tmp_dir.name,'masks')
+        self.args.flow_root=os.path.join(self.tmp_dir.name,'Flow')
+        for d in (self.args.img_root,self.args.mask_root, self.args.flow_root):
+            os.makedirs(d)
+        self.args.dataset_root=self.tmp_dir.name
+        self.args.frame_dir=self.args.img_root
+        self.args.pretrained_model_liteflownet=os.path.join(proj_dir, 'weights', 'liteflownet.pth')
+        self.args.pretrained_model_inpaint=os.path.join(proj_dir, 'weights', 'imagenet_deepfill.pth')
+        self.args.PRETRAINED_MODEL_1=os.path.join(proj_dir, 'weights', 'resnet101_movie.pth')
+        self.args.n_threads=self.settings.n_threads
+        self.args.output_root=self.tmp_dir.name
+        self.args.output_root_propagation=self.settings.outpath
+        self.args.img_size=[self.H, self.W]
+        self.args.img_shape=self.args.img_size
+        self.args.th_warp=self.settings.th_warp
+        self.args.enlarge_mask=self.settings.mask_enlarge>1
+        self.args.enlarge_kernel=self.settings.mask_enlarge
         # Load Model
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = nn.DataParallel(OPN()).to(device)
-        self.model.load_state_dict(torch.load(os.path.join(proj_dir, 'weights', 'OPN.pth')), strict=False)
-        self.model.eval()
-
-        self.pp_model = nn.DataParallel(TCN()).to(device)
-        self.pp_model.load_state_dict(torch.load(os.path.join(proj_dir, 'weights', 'TCN.pth')), strict=False)
-        self.pp_model.eval()
+        self.args.device=device
+        
         #mask = context.space_data.mask
         self.mask = bpy.data.masks[self.settings.mask_name]
         #co_tot, lhand_tot, rhand_tot = [], [], []
@@ -246,65 +276,114 @@ class CleanPlateMaker:
         self.i = -1
         self.state = 0
 
-    def memory_encoding(self):
-        self.comps = torch.zeros_like(self.frames)
-        self.ppeds = torch.zeros_like(self.frames)
-        # memory encoding
-        self.midx = list(range(0, self.T, self.settings.memevery))
+    def flow(self):
+        if self.i==-1:
+            #initialization
+            self.args.data_list = tools.infer_liteflownet.generate_flow_list(self.args.frame_dir)
+            print('====> Loading', self.args.pretrained_model_liteflownet)
+            self.Flownet = models.LiteFlowNet(self.args.pretrained_model_liteflownet)
+            self.Flownet.to(self.args.device)
+            self.Flownet.eval()
+
+            dataset_ = dataset.FlowInfer.FlowInfer(self.args.data_list, size=self.args.img_size)
+            self.flow_dataloader = DataLoader(dataset_, batch_size=1, shuffle=False, num_workers=0)
+        self.i+=1
         with torch.no_grad():
-            self.mkey, self.mval, self.mhol = self.model(self.frames[:, :, self.midx], self.valids[:, :, self.midx], self.dists[:, :, self.midx])
-        self.state += 1
+            f1, f2, output_path_ = next(self.flow_dataloader)
+            f1 = f1.to(self.args.device)
+            f2 = f2.to(self.args.device)
 
-    def inpainting(self):
-        self.i += 1
-        f = self.i
-        # memory selection
-        if f in self.midx:
-            ridx = [i for i in range(len(self.midx)) if i != int(f/self.settings.memevery)]
-        else:
-            ridx = list(range(len(self.midx)))
+            flow = tools.infer_liteflownet.estimate(self.Flownet, f1, f2)
 
-        fkey, fval, fhol = self.mkey[:, :, ridx], self.mval[:, :, ridx], self.mhol[:, :, ridx]
-        # inpainting..
-        for r in range(999):
-            if r == 0:
-                self.comp = self.frames[:, :, f]
-                self.dist = self.dists[:, :, f]
-            with torch.no_grad():
-                self.comp, self.dist = self.model(fkey, fval, fhol, self.comp, self.valids[:, :, f], self.dist)
-            # update
-            self.comp, self.dist = self.comp.detach(), self.dist.detach()
-            if torch.sum(self.dist).item() == 0:
-                break
-        self.comps[:, :, f] = self.comp
-        if f == self.T - 1:
-            self.i = -1
-            self.state += 1
-            self.ppeds[:, :, 0] = self.comps[:, :, 0]
-            self.hidden = None
+            output_path = output_path_[0]
+            output_file = os.path.dirname(output_path)
+            os.makedirs(output_file, exist_ok=True)
 
-    def postprocess(self):
-        self.i += 1
-        f = self.i
+            flow_numpy = flow[0].permute(1, 2, 0).data.cpu().numpy()
+            cvb.write_flow(flow_numpy, output_path)
+
+        if self.i == self.T-1:            
+            print('LiteFlowNet Inference has been finished!')
+            flow_list = [x for x in os.listdir(self.args.flow_root) if '.flo' in x]
+            flow_start_no = min([int(x[:5]) for x in flow_list])
+            del self.flow_dataloader, self.Flownet
+            zero_flow = cvb.read_flow(os.path.join(self.args.flow_root, flow_list[0]))
+            cvb.write_flow(zero_flow*0, os.path.join(self.args.flow_root, '%05d.rflo' % flow_start_no))
+            self.args.DATA_ROOT = self.args.flow_root
+            self.i=-1
+            self.state+=1
+
+    def flow_completion(self):
+        if self.i==-1:
+            data_list_dir = os.path.join(self.args.dataset_root, 'data')
+            os.makedirs(data_list_dir, exist_ok=True)
+            initial_data_list = os.path.join(data_list_dir, 'initial_test_list.txt')
+            print('Generate datalist for initial step')
+            dataset.data_list.gen_flow_initial_test_mask_list(flow_root=self.args.DATA_ROOT, output_txt_path=initial_data_list)
+            self.args.EVAL_LIST = os.path.join(data_list_dir, 'initial_test_list.txt')
+
+            self.args.output_root = os.path.join(self.args.dataset_root, 'Flow_res', 'initial_res')
+            self.args.PRETRAINED_MODEL = self.args.PRETRAINED_MODEL_1
+
+            if self.args.img_size is not None:
+                self.args.IMAGE_SHAPE = [self.args.img_size[0] // 2, self.args.img_size[1] // 2]
+                self.args.RES_SHAPE = self.args.IMAGE_SHAPE
+
+            print('Flow Completion in First Step')
+            self.args.INITIAL_HOLE = True
+            self.args.get_mask = True
+
+            eval_dataset = dataset.FlowInitial.FlowSeq(self.args, isTest=True)
+            self.flow_refinement_dataloader = DataLoader(eval_dataset, batch_size=self.settings.batch_size, shuffle=False, 
+                                                         drop_last=False, num_workers=self.args.n_threads)
+            if self.args.ResNet101:
+                dfc_resnet101 = models.resnet_models.Flow_Branch(33, 2)
+                self.dfc_resnet = nn.DataParallel(dfc_resnet101).to(self.args.device)
+            else:
+                dfc_resnet50 = models.resnet_models.Flow_Branch_Multi(input_chanels=33, NoLabels=2)
+                self.dfc_resnet = nn.DataParallel(dfc_resnet50).to(self.args.device)
+
+            self.dfc_resnet.eval()
+            utils.io.load_ckpt(self.args.PRETRAINED_MODEL, [('model', self.dfc_resnet)], strict=True)
+            print('Load Pretrained Model from', self.args.PRETRAINED_MODEL)
+
+        self.i+=1
         with torch.no_grad():
-            self.pped,  self.hidden = self.pp_model(self.ppeds[:, :, f-1], self.holes[:, :, f-1], self.comps[:, :, f], self.holes[:, :, f], self.hidden)
-            self.ppeds[:, :, f] = self.pped
-        if f == self.T - 1:
-            self.i = -1
-            self.state += 1
+            item = next(self.flow_refinement_dataloader)
+            input_x = item[0].to(self.args.device)
+            flow_masked = item[1]
+            mask = item[3].to(self.args.device)
+            output_dir = item[4][0]
 
-    def save(self, context):
-        self.i += 1
-        f = self.i
-        canvas = (self.ppeds[0, :, f].permute(1, 2, 0).detach().cpu().numpy() * 255.).astype(np.uint8)
-        save_path = self.settings.outpath
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
-        canvas = Image.fromarray(canvas)
-        canvas.save(os.path.join(save_path, '%05d.%s' % (f+context.scene.frame_start, self.settings.imgending)))
-        if f == self.T - 1:
-            self.i = -1
-            self.state += 1
+            res_flow = self.dfc_resnet(input_x)
+            res_complete = res_flow * mask[:, 10:11, :, :] + flow_masked[:, 10:12, :, :] * (1. - mask[:, 10:11, :, :])
+
+            output_dir_split = output_dir.split(',')
+            output_file = os.path.join(self.args.output_root, output_dir_split[0])
+            output_basedir = os.path.dirname(output_file)
+            if not os.path.exists(output_basedir):
+                os.makedirs(output_basedir)
+            res_save = res_complete[0].permute(1, 2, 0).contiguous().cpu().data.numpy()
+            cvb.write_flow(res_save, output_file)
+        if self.i == len(self.flow_refinement_dataloader.dataset) - 1:
+            self.args.flow_root = self.args.output_root
+            del self.flow_refinement_dataloader, self.dfc_resnet
+            self.i=-1
+            self.state+=1
+
+    def propagation(self):
+        if self.i==-1:
+            self.deepfill_model = tools.frame_inpaint.DeepFillv1(pretrained_model=self.args.pretrained_model_inpaint, image_shape=self.args.img_shape)
+            self.prop=tools.propagation_inpaint.modal_propagation(self.args, frame_inpaint_model=self.deepfill_model)
+        self.i+=1
+        complete=self.prop.step()
+        if complete:
+            self.state+=1
+            del self.deepfill_model
+
+    def close(self):
+        self.wm.progress_end()
+        self.tmp_dir.cleanup()
 
     def cleanplate(self, context):
         if self.state == -1:
@@ -312,19 +391,17 @@ class CleanPlateMaker:
         elif self.state == 0:
             self.collect_next_frame()
         elif self.state == 1:
-            self.memory_encoding()
+            self.flow()
         elif self.state == 2:
-            self.inpainting()
+            self.flow_completion()
         elif self.state == 3:
-            self.postprocess()
+            self.propagation()
         elif self.state == 4:
-            self.save(context)
-        elif self.state == 5:
             self.state = -1
-            self.wm.progress_end()
+            self.close()
             return {'FINISHED'}
         self.progress += 1
-        self.wm.progress_update(np.clip(self.progress, 0, 2+self.T*4))
+        self.wm.progress_update(np.clip(self.progress, 0, 2+self.T*5))
 
 
 class OBJECT_OT_cleanplate(Operator):
@@ -391,9 +468,12 @@ class PANEL0_PT_cleanplate(Panel):
         layout.use_property_split = True  # Active single-column layout
         layout.prop(settings, 'mask_name')
         layout.prop(settings, 'downscale')
-        layout.prop(settings, 'memevery')
+        layout.prop(settings, 'mask_enlarge')
         layout.prop(settings, 'imgending', icon='FILE_IMAGE')
         layout.prop(settings, 'outpath')
+        layout.prop(settings, 'n_threads')
+        layout.prop(settings, 'batch_size')
+        layout.prop(settings, 'th_warp')
         layout.separator()
         row = layout.row()
         row.operator("object.cleanplate", text="Create Clean Plate")
