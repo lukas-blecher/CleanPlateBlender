@@ -110,7 +110,7 @@ def main():
                           res_shape=args.res_shape)
 
     test_image = cv2.imread(args.test_img)
-    mask = cv2.imread(args.test_mask, cv2.IMREAD_UNCHANGED)
+    mask = cv2.imread(args.test_mask, cv2.IMREAD_COLOR)
 
     with torch.no_grad():
         img_res = deepfill.forward(test_image, mask)

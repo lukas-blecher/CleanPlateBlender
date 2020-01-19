@@ -92,16 +92,13 @@ class FlowSeq(data.Dataset):
             tmp_flow = cvb.read_flow(f_flow_dir[i])
             if self.config.get_mask:
                 tmp_mask = cv2.imread(mask_dirs[i],
-                                      cv2.IMREAD_UNCHANGED)
+                                      cv2.IMREAD_COLOR)
                 tmp_mask = self._mask_tf(tmp_mask)
             else:
-                if self.config.FIX_MASK:
-                    tmp_mask = fix_mask.copy()
-                else:
-                    tmp_bbox = im.random_bbox(self.config)
-                    tmp_mask = im.bbox2mask(self.config, tmp_bbox)
-                    tmp_mask = tmp_mask[0, 0, :, :]
-                    tmp_mask = np.expand_dims(tmp_mask, axis=2)
+                tmp_bbox = im.random_bbox(self.config)
+                tmp_mask = im.bbox2mask(self.config, tmp_bbox)
+                tmp_mask = tmp_mask[0, 0, :, :]
+                tmp_mask = np.expand_dims(tmp_mask, axis=2)
 
             tmp_flow = self._flow_tf(tmp_flow)
             tmp_flow_masked = tmp_flow
@@ -118,16 +115,13 @@ class FlowSeq(data.Dataset):
 
             if self.config.get_mask:
                 tmp_mask = cv2.imread(mask_dirs[i+11],
-                                      cv2.IMREAD_UNCHANGED)
+                                      cv2.IMREAD_COLOR)
                 tmp_mask = self._mask_tf(tmp_mask)
             else:
-                if self.config.FIX_MASK:
-                    tmp_mask = fix_mask.copy()
-                else:
-                    tmp_bbox = im.random_bbox(self.config)
-                    tmp_mask = im.bbox2mask(self.config, tmp_bbox)
-                    tmp_mask = tmp_mask[0, 0, :, :]
-                    tmp_mask = np.expand_dims(tmp_mask, axis=2)
+                tmp_bbox = im.random_bbox(self.config)
+                tmp_mask = im.bbox2mask(self.config, tmp_bbox)
+                tmp_mask = tmp_mask[0, 0, :, :]
+                tmp_mask = np.expand_dims(tmp_mask, axis=2)
 
             tmp_flow_masked = tmp_flow
 

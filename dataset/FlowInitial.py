@@ -30,10 +30,7 @@ class FlowSeq(data.Dataset):
                     flow_dir = [os.path.join(self.config.DATA_ROOT, x) for x in flow_dir]
                 if self.config.get_mask:
                     mask_dir = line_split[11:22]
-                    if not self.config.FIX_MASK:
-                        mask_dir = [os.path.join(self.config.MASK_ROOT, x) for x in mask_dir]
-                    else:
-                        mask_dir = [os.path.join(self.config.MASK_ROOT) for x in mask_dir]
+                    mask_dir = [os.path.join(self.config.MASK_ROOT, x) for x in mask_dir]
                 video_class_no = int(line_split[-1])
                 if not self.isTest:
                     self.data_items.append((flow_dir, video_class_no))
@@ -74,16 +71,13 @@ class FlowSeq(data.Dataset):
             tmp_flow = cvb.read_flow(flow_dir[i])
             if self.config.get_mask:
                 tmp_mask = cv2.imread(mask_dir[i],
-                                      cv2.IMREAD_UNCHANGED)
+                                      cv2.IMREAD_COLOR)
                 tmp_mask = self._mask_tf(tmp_mask)
             else:
-                if self.config.FIX_MASK:
-                    tmp_mask = fix_mask.copy()
-                else:
-                    tmp_bbox = im.random_bbox(self.config)
-                    tmp_mask = im.bbox2mask(self.config, tmp_bbox)
-                    tmp_mask = tmp_mask[0, 0, :, :]
-                    tmp_mask = np.expand_dims(tmp_mask, axis=2)
+                tmp_bbox = im.random_bbox(self.config)
+                tmp_mask = im.bbox2mask(self.config, tmp_bbox)
+                tmp_mask = tmp_mask[0, 0, :, :]
+                tmp_mask = np.expand_dims(tmp_mask, axis=2)
             tmp_flow = self._flow_tf(tmp_flow)
             tmp_flow_masked = tmp_flow * (1. - tmp_mask)
 
@@ -133,8 +127,8 @@ class FlowSeq(data.Dataset):
                                      np.uint8)
             tmp_mask = cv2.dilate(mask[:, :, 0], enlarge_kernel, iterations=1)
             mask[(tmp_mask > 0), :] = 255
-
-        mask = mask[:,:,0]
+        if len(mask.shape) == 3:
+            mask = mask[:,:,0]
         mask = np.expand_dims(mask, axis=2)
         mask = mask / 255
 

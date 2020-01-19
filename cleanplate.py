@@ -21,10 +21,10 @@ from geomdl import BSpline, utilities
 import cvbase as cvb
 from PIL import Image, ImageDraw
 import numpy as np
-import dataset
-import models
-import tools
-import utils
+from dataset import FlowInfer, data_list, FlowInitial
+from models import LiteFlowNet, resnet_models
+from tools import infer_liteflownet, frame_inpaint, propagation_inpaint
+from utils import io
 
 
 bl_info = {
@@ -37,6 +37,9 @@ bl_info = {
 
 class Arguments:
     LiteFlowNet,DFC,ResNet101=True,True,True
+    MASK_MODE=None
+    INITIAL_HOLE=True
+    get_mask=True
 
 def mask_name_callback(scene, context):
     items = []
@@ -186,8 +189,9 @@ class CleanPlateMaker:
         ret, frame = self.cap.read()
         curr_frame = bpy.context.scene.frame_current
         # state finished. return and go to next state
-        if not ret or self.i == self.T:
+        if not ret or curr_frame == self.frame_end+1:
             self.cap.release()
+            bpy.ops.clip.change_frame(frame=self.frame_end)
             self.i = -1
             self.state += 1
             return
@@ -217,16 +221,15 @@ class CleanPlateMaker:
                 raw_mask += spline2mask(crl, self.hw[1], self.hw[0], downscale=self.settings.downscale).astype(np.uint8)
         raw_mask = np.clip(raw_mask, 0, 1)
         
-        Image.fromarray(raw_mask*255).resize(self.W, self.H, Image.BILINEAR).save(os.path.join(self.args.mask_root,'%05d.png'%curr_frame))
+        Image.fromarray(raw_mask*255).resize((self.W, self.H), Image.BILINEAR).save(os.path.join(self.args.mask_root,'%05d.png'%curr_frame))
         #canvas.save(os.path.join(self.settings.outpath, '%05dmask.%s'%(self.i, self.settings.imgending)))
-        
         bpy.ops.clip.change_frame(frame=curr_frame+1)
 
     def setup(self, context):
         proj_dir = paths[-1]
         if proj_dir == '':
             raise ValueError('CleanPlateBlender path is empty.')
-
+        self.frame_end=context.scene.frame_end
         self.settings = context.scene.cp_settings
         self.T = context.scene.frame_end-context.scene.frame_start
         assert self.T >= 12, 'At least 12 frames are required'
@@ -279,30 +282,34 @@ class CleanPlateMaker:
     def flow(self):
         if self.i==-1:
             #initialization
-            self.args.data_list = tools.infer_liteflownet.generate_flow_list(self.args.frame_dir)
+            self.args.data_list = infer_liteflownet.generate_flow_list(self.args.frame_dir)
             print('====> Loading', self.args.pretrained_model_liteflownet)
-            self.Flownet = models.LiteFlowNet(self.args.pretrained_model_liteflownet)
+            self.Flownet = LiteFlowNet(self.args.pretrained_model_liteflownet)
             self.Flownet.to(self.args.device)
             self.Flownet.eval()
 
-            dataset_ = dataset.FlowInfer.FlowInfer(self.args.data_list, size=self.args.img_size)
-            self.flow_dataloader = DataLoader(dataset_, batch_size=1, shuffle=False, num_workers=0)
+            dataset_ = FlowInfer.FlowInfer(self.args.data_list, size=self.args.img_size)
+            self.flow_dataloader = iter(DataLoader(dataset_, batch_size=1, shuffle=False, num_workers=0))
         self.i+=1
+        complete=False
         with torch.no_grad():
-            f1, f2, output_path_ = next(self.flow_dataloader)
-            f1 = f1.to(self.args.device)
-            f2 = f2.to(self.args.device)
+            try:
+                f1, f2, output_path_ = next(self.flow_dataloader)
+                f1 = f1.to(self.args.device)
+                f2 = f2.to(self.args.device)
 
-            flow = tools.infer_liteflownet.estimate(self.Flownet, f1, f2)
+                flow = infer_liteflownet.estimate(self.Flownet, f1, f2)
 
-            output_path = output_path_[0]
-            output_file = os.path.dirname(output_path)
-            os.makedirs(output_file, exist_ok=True)
+                output_path = output_path_[0]
+                output_file = os.path.dirname(output_path)
+                os.makedirs(output_file, exist_ok=True)
 
-            flow_numpy = flow[0].permute(1, 2, 0).data.cpu().numpy()
-            cvb.write_flow(flow_numpy, output_path)
-
-        if self.i == self.T-1:            
+                flow_numpy = flow[0].permute(1, 2, 0).data.cpu().numpy()
+                cvb.write_flow(flow_numpy, output_path)
+            except StopIteration:
+                complete = True
+                
+        if self.i == len(self.flow_dataloader) - 1 or complete:            
             print('LiteFlowNet Inference has been finished!')
             flow_list = [x for x in os.listdir(self.args.flow_root) if '.flo' in x]
             flow_start_no = min([int(x[:5]) for x in flow_list])
@@ -319,7 +326,7 @@ class CleanPlateMaker:
             os.makedirs(data_list_dir, exist_ok=True)
             initial_data_list = os.path.join(data_list_dir, 'initial_test_list.txt')
             print('Generate datalist for initial step')
-            dataset.data_list.gen_flow_initial_test_mask_list(flow_root=self.args.DATA_ROOT, output_txt_path=initial_data_list)
+            data_list.gen_flow_initial_test_mask_list(flow_root=self.args.DATA_ROOT, output_txt_path=initial_data_list)
             self.args.EVAL_LIST = os.path.join(data_list_dir, 'initial_test_list.txt')
 
             self.args.output_root = os.path.join(self.args.dataset_root, 'Flow_res', 'initial_res')
@@ -330,42 +337,43 @@ class CleanPlateMaker:
                 self.args.RES_SHAPE = self.args.IMAGE_SHAPE
 
             print('Flow Completion in First Step')
-            self.args.INITIAL_HOLE = True
-            self.args.get_mask = True
-
-            eval_dataset = dataset.FlowInitial.FlowSeq(self.args, isTest=True)
-            self.flow_refinement_dataloader = DataLoader(eval_dataset, batch_size=self.settings.batch_size, shuffle=False, 
-                                                         drop_last=False, num_workers=self.args.n_threads)
+            self.args.MASK_ROOT=self.args.mask_root
+            eval_dataset = FlowInitial.FlowSeq(self.args, isTest=True)
+            self.flow_refinement_dataloader = iter(DataLoader(eval_dataset, batch_size=self.settings.batch_size, shuffle=False, 
+                                                         drop_last=False, num_workers=self.args.n_threads))
             if self.args.ResNet101:
-                dfc_resnet101 = models.resnet_models.Flow_Branch(33, 2)
+                dfc_resnet101 = resnet_models.Flow_Branch(33, 2)
                 self.dfc_resnet = nn.DataParallel(dfc_resnet101).to(self.args.device)
             else:
-                dfc_resnet50 = models.resnet_models.Flow_Branch_Multi(input_chanels=33, NoLabels=2)
+                dfc_resnet50 = resnet_models.Flow_Branch_Multi(input_chanels=33, NoLabels=2)
                 self.dfc_resnet = nn.DataParallel(dfc_resnet50).to(self.args.device)
-
             self.dfc_resnet.eval()
-            utils.io.load_ckpt(self.args.PRETRAINED_MODEL, [('model', self.dfc_resnet)], strict=True)
+            io.load_ckpt(self.args.PRETRAINED_MODEL, [('model', self.dfc_resnet)], strict=True)
             print('Load Pretrained Model from', self.args.PRETRAINED_MODEL)
 
         self.i+=1
+        complete=False
         with torch.no_grad():
-            item = next(self.flow_refinement_dataloader)
-            input_x = item[0].to(self.args.device)
-            flow_masked = item[1]
-            mask = item[3].to(self.args.device)
-            output_dir = item[4][0]
+            try:
+                item = next(self.flow_refinement_dataloader)
+                input_x = item[0].to(self.args.device)
+                flow_masked = item[1].to(self.args.device)
+                mask = item[3].to(self.args.device)
+                output_dir = item[4][0]
 
-            res_flow = self.dfc_resnet(input_x)
-            res_complete = res_flow * mask[:, 10:11, :, :] + flow_masked[:, 10:12, :, :] * (1. - mask[:, 10:11, :, :])
+                res_flow = self.dfc_resnet(input_x)
+                res_complete = res_flow * mask[:, 10:11, :, :] + flow_masked[:, 10:12, :, :] * (1. - mask[:, 10:11, :, :])
 
-            output_dir_split = output_dir.split(',')
-            output_file = os.path.join(self.args.output_root, output_dir_split[0])
-            output_basedir = os.path.dirname(output_file)
-            if not os.path.exists(output_basedir):
-                os.makedirs(output_basedir)
-            res_save = res_complete[0].permute(1, 2, 0).contiguous().cpu().data.numpy()
-            cvb.write_flow(res_save, output_file)
-        if self.i == len(self.flow_refinement_dataloader.dataset) - 1:
+                output_dir_split = output_dir.split(',')
+                output_file = os.path.join(self.args.output_root, output_dir_split[0])
+                output_basedir = os.path.dirname(output_file)
+                if not os.path.exists(output_basedir):
+                    os.makedirs(output_basedir)
+                res_save = res_complete[0].permute(1, 2, 0).contiguous().cpu().data.numpy()
+                cvb.write_flow(res_save, output_file)
+            except StopIteration:
+                complete=True
+        if self.i == len(self.flow_refinement_dataloader) - 1 or complete:
             self.args.flow_root = self.args.output_root
             del self.flow_refinement_dataloader, self.dfc_resnet
             self.i=-1
@@ -373,11 +381,15 @@ class CleanPlateMaker:
 
     def propagation(self):
         if self.i==-1:
-            self.deepfill_model = tools.frame_inpaint.DeepFillv1(pretrained_model=self.args.pretrained_model_inpaint, image_shape=self.args.img_shape)
-            self.prop=tools.propagation_inpaint.modal_propagation(self.args, frame_inpaint_model=self.deepfill_model)
+            self.deepfill_model = frame_inpaint.DeepFillv1(pretrained_model=self.args.pretrained_model_inpaint, image_shape=self.args.img_shape)
+            self.prop=propagation_inpaint.modal_propagation(self.args, frame_inpaint_model=self.deepfill_model)
         self.i+=1
         complete=self.prop.step()
+        if self.prop.change_iter_num and not complete:
+            self.prop.change_iter_num=False
+            self.wm.progress_update(self.T*2)
         if complete:
+            self.i= -1
             self.state+=1
             del self.deepfill_model
 
@@ -471,7 +483,7 @@ class PANEL0_PT_cleanplate(Panel):
         layout.prop(settings, 'mask_enlarge')
         layout.prop(settings, 'imgending', icon='FILE_IMAGE')
         layout.prop(settings, 'outpath')
-        layout.prop(settings, 'n_threads')
+        #layout.prop(settings, 'n_threads')
         layout.prop(settings, 'batch_size')
         layout.prop(settings, 'th_warp')
         layout.separator()

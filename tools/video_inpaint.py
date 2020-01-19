@@ -153,7 +153,7 @@ def flow_guided_propagation(args):
 
     from tools.propagation_inpaint import propagation
     propagation(args,
-                frame_inapint_model=deepfill_model)
+                frame_inpaint_model=deepfill_model)
 
 
 def main():
