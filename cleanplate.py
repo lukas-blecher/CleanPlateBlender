@@ -114,7 +114,7 @@ class Settings(PropertyGroup):
     )
 
 
-def spline2mask(crl, width, height, delta=.05, downscale=1):
+def spline2mask(crl, width, height, delta=.05, new_shape=None):
     c, r, l = crl if type(crl) == list else crl.tolist()
     cps = []
     for i in range(len(c)):
@@ -134,7 +134,9 @@ def spline2mask(crl, width, height, delta=.05, downscale=1):
     polygon = np.array(connecs).flatten().tolist()
     img = Image.new('L', (height, width), 255)
     ImageDraw.Draw(img).polygon(polygon, outline=0, fill=0)
-    mask = np.array(img.resize((int(height//downscale), int(width//downscale)), Image.NEAREST))
+    if new_shape is None:
+        new_shape = (height, width)
+    mask = np.array(img.resize(new_shape, Image.NEAREST))
     #print(mask.shape, width, height, downscale,int(width//downscale), int(height//downscale))
     return mask == False
 
@@ -218,7 +220,7 @@ class CleanPlateMaker:
                 # collection of coordinates and handles
                 crl = [co, rhand, lhand]
                 # get mask from the point coordinates
-                raw_mask += spline2mask(crl, self.hw[1], self.hw[0], downscale=self.settings.downscale).astype(np.uint8)
+                raw_mask += spline2mask(crl, self.hw[1], self.hw[0], new_shape=(self.W, self.H)).astype(np.uint8)
         raw_mask = np.clip(raw_mask, 0, 1)
         
         Image.fromarray(raw_mask*255).resize((self.W, self.H), Image.BILINEAR).save(os.path.join(self.args.mask_root,'%05d.png'%curr_frame))
@@ -234,7 +236,7 @@ class CleanPlateMaker:
         self.T = context.scene.frame_end-context.scene.frame_start
         assert self.T >= 12, 'At least 12 frames are required'
         self.W, self.H = self.hw  # context.scene.render.resolution_y, context.scene.render.resolution_x
-        self.W, self.H = int(self.W//self.settings.downscale), int(self.H//self.settings.downscale)
+        self.W, self.H = int(4*round(self.W/self.settings.downscale/4)), int(4*round(self.H/self.settings.downscale/4))
 
         # progress bar
         self.progress = 0

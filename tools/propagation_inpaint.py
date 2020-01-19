@@ -294,7 +294,7 @@ class modal_propagation:
                 os.makedirs(self.output_root)
 
             for th in range(0, self.frames_num-1):
-                cv2.imwrite(os.path.join(self.output_root, 'inpaint_res', '%05d.png' % (th + self.flow_start_no)),
+                cv2.imwrite(os.path.join(self.output_root, '%05d.png' % (th + self.flow_start_no)),
                             self.result_pool[th].astype(np.uint8))
 
             print('Propagation has been finished')
