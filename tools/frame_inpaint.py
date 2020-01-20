@@ -17,9 +17,8 @@ class DeepFillv1(object):
         self.res_shape = res_shape
         self.device = device
 
-        self.deepfill = DeepFill.Generator().to(device)
-        model_weight = torch.load(pretrained_model)
-        self.deepfill.load_state_dict(model_weight, strict=True)
+        self.deepfill = DeepFill.Generator(device=device).to(device)
+        self.deepfill.load_state_dict(torch.load(pretrained_model), strict=True)
         self.deepfill.eval()
         print('Load Deepfill Model from', pretrained_model)
 

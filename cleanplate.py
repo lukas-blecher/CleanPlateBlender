@@ -145,6 +145,7 @@ def spline2mask(crl, width, height, delta=.05, new_shape=None):
 
 class CleanPlateMaker:
     state = -1
+    complete = False
 
     def big_trans(self, inv=False):
         return lambda x: x
@@ -238,8 +239,8 @@ class CleanPlateMaker:
         self.T = context.scene.frame_end-context.scene.frame_start
         assert self.T >= 12, 'At least 12 frames are required'
         self.W, self.H = self.hw  # context.scene.render.resolution_y, context.scene.render.resolution_x
-        self.W, self.H = int(4*round(self.W/self.settings.downscale/4)), int(4*round(self.H/self.settings.downscale/4))
-
+        self.W, self.H = int(8*round(self.W/self.settings.downscale/8)), int(8*round(self.H/self.settings.downscale/8))
+        self.complete = False
         # progress bar
         self.progress = 0
         self.wm = context.window_manager
@@ -399,6 +400,7 @@ class CleanPlateMaker:
             del self.deepfill_model
 
     def close(self):
+        self.complete = True
         self.wm.progress_end()
         self.tmp_dir.cleanup()
 
@@ -463,6 +465,8 @@ class OBJECT_OT_cleanplate(Operator):
         if self._timer is not None:
             context.window_manager.event_timer_remove(self._timer)
             self._timer = None
+            if self.cpm.complete:
+                self.report({'INFO'}, "Inpainting complete.")
             del self.cpm
         return {'CANCELLED'}
 
