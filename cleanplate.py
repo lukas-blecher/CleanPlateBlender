@@ -109,12 +109,6 @@ class Settings(PropertyGroup):
         min=1
     )
 
-    change_layer: BoolProperty(
-        name="Change Layer",
-        description="Change the active Mask Layer according to the frame\nwhen moving the along the timeline",
-        default=True
-    )
-
 
 def spline2mask(crl, width, height, delta=.05, new_shape=None):
     c, r, l = crl if type(crl) == list else crl.tolist()
