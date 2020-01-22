@@ -23,7 +23,7 @@ from PIL import Image, ImageDraw
 import numpy as np
 from dataset import FlowInfer, data_list, FlowInitial
 from models import LiteFlowNet, resnet_models
-from tools import infer_liteflownet, frame_inpaint, propagation_inpaint
+from tools import infer_liteflownet, frame_inpaint, propagation_inpaint, test_scripts
 from utils import io
 
 
@@ -41,6 +41,8 @@ class Arguments:
     MASK_MODE = None
     INITIAL_HOLE = True
     get_mask = True
+    GT_FLOW_ROOT = None
+    FIX_MASK = False
 
 
 def mask_name_callback(scene, context):
@@ -107,6 +109,18 @@ class Settings(PropertyGroup):
         description="How much to downscale the image",
         default=1,
         min=1
+    )
+
+    multiscale: BoolProperty(
+        name="Multi-scale",
+        description="Using the multi-scale models",
+        default=False
+    )
+
+    resnet101: BoolProperty(
+        name="ResNet101",
+        description="Use ResNet101 if both ResNet101 and\nResNet50 are available",
+        default=True
     )
 
 
@@ -254,15 +268,31 @@ class CleanPlateMaker:
         self.args.frame_dir = self.args.img_root
         self.args.pretrained_model_liteflownet = os.path.join(proj_dir, 'weights', 'liteflownet.pth')
         self.args.pretrained_model_inpaint = os.path.join(proj_dir, 'weights', 'imagenet_deepfill.pth')
-        self.args.PRETRAINED_MODEL_1 = os.path.join(proj_dir, 'weights', 'resnet101_movie.pth')
+        # check for resnet 101 vs 50
+        def null_or_first(l):
+            if len(l) == 0:
+                return None
+            else:
+                return l[0]
+        models=sorted(os.listdir(os.path.join(proj_dir, 'weights')))
+        resnet=null_or_first([x for x in models if 'resnet101' in x])
+        res50=null_or_first([x for x in models if 'stage1' in x])
+        if (resnet is None and res50 is not None) or (resnet is not None and res50 is not None and not self.settings.resnet101):
+            resnet=res50
+            self.args.ResNet101=False
+                
+        self.args.PRETRAINED_MODEL_1 = os.path.join(proj_dir, 'weights', resnet)
+        self.args.PRETRAINED_MODEL_2 = os.path.join(proj_dir, 'weights', null_or_first([x for x in models if 'stage2' in x]))
+        self.args.PRETRAINED_MODEL_3 = os.path.join(proj_dir, 'weights', null_or_first([x for x in models if 'stage3' in x]))
         self.args.n_threads = self.settings.n_threads
         self.args.output_root = self.tmp_dir.name
         self.args.output_root_propagation = self.settings.outpath
         self.args.img_size = [self.H, self.W]
         self.args.img_shape = self.args.img_size
         self.args.th_warp = self.settings.th_warp
-        self.args.enlarge_mask = self.settings.mask_enlarge > 1
+        self.args.enlarge_mask = self.settings.mask_enlarge > 0
         self.args.enlarge_kernel = self.settings.mask_enlarge
+        self.args.batch_size = self.settings.batch_size
         # Load Model
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.args.device = device
@@ -288,7 +318,7 @@ class CleanPlateMaker:
             self.Flownet.eval()
 
             dataset_ = FlowInfer.FlowInfer(self.args.data_list, size=self.args.img_size)
-            self.flow_dataloader = iter(DataLoader(dataset_, batch_size=1, shuffle=False, num_workers=0))
+            self.flow_dataloader = iter(DataLoader(dataset_, batch_size=self.args.batch_size, shuffle=False, num_workers=0))
         self.i += 1
         complete = False
         with torch.no_grad():
@@ -378,6 +408,22 @@ class CleanPlateMaker:
             self.i = -1
             self.state += 1
 
+    def multiscale(self):
+        if self.i == -1:
+            self.ms=test_scripts.modal_multiscale(self.args)
+        self.i += 1
+        try:
+            complete = self.ms.step()
+        except StopIteration:
+            complete = True
+
+        if complete:
+            self.i = -1
+            self.state += 1
+            self.args=self.ms.args
+            del self.ms
+
+
     def propagation(self):
         if self.i == -1:
             self.deepfill_model = frame_inpaint.DeepFillv1(pretrained_model=self.args.pretrained_model_inpaint, image_shape=self.args.img_shape)
@@ -408,8 +454,14 @@ class CleanPlateMaker:
         elif self.state == 2:
             self.flow_completion()
         elif self.state == 3:
-            self.propagation()
+            if not self.settings.multiscale:
+                self.state+=1
+                self.cleanplate(context)
+            else:
+                self.multiscale()
         elif self.state == 4:
+            self.propagation()
+        elif self.state == 5:
             self.state = -1
             self.close()
             return {'FINISHED'}
@@ -433,7 +485,11 @@ class OBJECT_OT_cleanplate(Operator):
             self._updating = True
             #frame_end = context.scene.frame_end
             # if bpy.context.scene.frame_current < frame_end:
-            ret = self.cpm.cleanplate(context)
+            try:
+                ret = self.cpm.cleanplate(context)
+            except Exception as e:
+                self.cpm.close()
+                raise e
             if type(ret) == set:
                 self._calcs_done = True
 
@@ -489,6 +545,8 @@ class PANEL0_PT_cleanplate(Panel):
         #layout.prop(settings, 'n_threads')
         layout.prop(settings, 'batch_size')
         layout.prop(settings, 'th_warp')
+        layout.prop(settings, 'multiscale')
+        layout.prop(settings, 'resnet101')
         layout.separator()
         row = layout.row()
         row.operator("object.cleanplate", text="Create Clean Plate")

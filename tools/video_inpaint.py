@@ -126,8 +126,7 @@ def flow_completion(args):
 
         stage2_data_list = os.path.join(data_list_dir, 'stage2_test_list.txt')
         from dataset.data_list import gen_flow_refine_test_mask_list
-        gen_flow_refine_test_mask_list(flow_root=args.DATA_ROOT,
-                                       output_txt_path=stage2_data_list)
+        gen_flow_refine_test_mask_list(flow_root=args.DATA_ROOT, output_txt_path=stage2_data_list)
         args.EVAL_LIST = stage2_data_list
         test_refine_stage(args)
 
