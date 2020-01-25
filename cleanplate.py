@@ -261,7 +261,7 @@ class CleanPlateMaker:
         self.args.img_size = [self.H, self.W]
         self.args.img_shape = self.args.img_size
         self.args.th_warp = self.settings.th_warp
-        self.args.enlarge_mask = self.settings.mask_enlarge > 1
+        self.args.enlarge_mask = self.settings.mask_enlarge > 0
         self.args.enlarge_kernel = self.settings.mask_enlarge
         # Load Model
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -487,7 +487,7 @@ class PANEL0_PT_cleanplate(Panel):
         layout.prop(settings, 'imgending', icon='FILE_IMAGE')
         layout.prop(settings, 'outpath')
         #layout.prop(settings, 'n_threads')
-        layout.prop(settings, 'batch_size')
+        #layout.prop(settings, 'batch_size')
         layout.prop(settings, 'th_warp')
         layout.separator()
         row = layout.row()

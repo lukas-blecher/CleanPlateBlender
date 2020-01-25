@@ -12,7 +12,6 @@ Create a mask for the object you want to remove in the `Clip Editor`. This Add-o
 * Enlarge Mask: If your mask is not covering the object completley this parameter enlarges the mask during computation.
 * File Format: The image format of the output images.
 * Output Directory: Where to save the output images.
-* Batch Size: How many images to process at once. Set this to 1 in case of memory problems.
 * Threshold: If you are not satisfied with the results try varying this parameter.
 
 ## Installation
