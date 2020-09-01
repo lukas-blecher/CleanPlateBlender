@@ -266,7 +266,7 @@ class CleanPlateMaker:
         self.args.inter_root = os.path.join(self.tmp_dir.name, 'interp')
         for d in (self.args.img_root, self.args.mask_root, self.args.flow_root):
             os.makedirs(d)
-        self.imgending = self.settings.imgending
+        self.args.imgending = self.settings.imgending
         self.args.dataset_root = self.tmp_dir.name
         self.args.frame_dir = self.args.img_root
         self.args.pretrained_model_liteflownet = os.path.join(proj_dir, 'weights', 'liteflownet.pth')
@@ -280,7 +280,7 @@ class CleanPlateMaker:
         self.args.th_warp = self.settings.th_warp
         self.args.enlarge_mask = self.settings.mask_enlarge > 0
         self.args.enlarge_kernel = self.settings.mask_enlarge
-        self.interpolation_steps = self.settings.steps
+        self.args.interpolation_steps = self.settings.steps
         # Load Model
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.args.device = device
@@ -436,6 +436,7 @@ class CleanPlateMaker:
 
 
 class FrameInterpolator(CleanPlateMaker):
+
     def collect_next_frame(self):
         self.i += 1
         ret, frame = self.cap.read()
@@ -471,9 +472,9 @@ class FrameInterpolator(CleanPlateMaker):
         elif self.state == 1:
             self.flow()
         elif self.state == 2:
-            self.flow_completion()
-        elif self.state == 3:
             self.interpolate()
+        elif self.state == 3:
+            self.flow_completion()
         elif self.state == 4:
             self.propagation()
         elif self.state == 5:

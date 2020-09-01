@@ -89,7 +89,7 @@ class FlowSeq(data.Dataset):
                 tmp_flow_masked_small[:, :, 1] = rf.regionfill(tmp_flow_resized[:, :, 1], tmp_mask_resized)
 
                 tmp_flow_masked = tmp_flow_masked + \
-                                  tmp_mask * cv2.resize(tmp_flow_masked_small, (self.size[1], self.size[0]))
+                    tmp_mask * cv2.resize(tmp_flow_masked_small, (self.size[1], self.size[0]))
 
             flow_masked_set.append(tmp_flow_masked)
             flow_set.append(tmp_flow)
@@ -120,15 +120,15 @@ class FlowSeq(data.Dataset):
         return img
 
     def _mask_tf(self, mask):
-        mask = cv2.resize(mask, (self.size[1], self.size[0]),
-                          interpolation=cv2.INTER_NEAREST)
+        print('Size:', self.size, (self.size[1], self.size[0]), mask.shape)
+        mask = cv2.resize(mask, (self.size[1], self.size[0]), interpolation=cv2.INTER_NEAREST)
         if self.config.enlarge_mask:
             enlarge_kernel = np.ones((self.config.enlarge_kernel, self.config.enlarge_kernel),
                                      np.uint8)
             tmp_mask = cv2.dilate(mask[:, :, 0], enlarge_kernel, iterations=1)
             mask[(tmp_mask > 0), :] = 255
         if len(mask.shape) == 3:
-            mask = mask[:,:,0]
+            mask = mask[:, :, 0]
         mask = np.expand_dims(mask, axis=2)
         mask = mask / 255
 

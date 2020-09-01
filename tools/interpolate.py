@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 # modified from: https://github.com/sniklaus/softmax-splatting
-import sys, os
+import sys
+import os
 sys.path.append(os.path.abspath(os.path.join(__file__, '..', '..')))
-from tools import softsplat
-import numpy as np
-import cv2
 import torch
+import cv2
+import numpy as np
+from tools import softsplat
 
 
 class Interpolater:
@@ -19,7 +20,7 @@ class Interpolater:
         self.ending = args.imgending
         self.steps = args.interpolation_steps
         self.device = args.device
-        self.flows = os.listdir(self.flow_root)
+        self.flows = [flow for flow in os.listdir(self.flow_root) if '.flo' in flow]
         self.img_shape = args.img_shape
 
         self.frame_name_list = sorted(os.listdir(self.img_root))
@@ -34,13 +35,13 @@ class Interpolater:
         self.interpolate()
         self.move_idx(self.index)
         self.index += 1
-        if self.index > self.frames_num:
+        if self.index > len(self):
             self.move_idx(self.index)
             return True
         return False
 
     def move_idx(self, idx):
-        os.replace(self.frame_name_list[idx], '%s/%08.3f.%s' % (self.inter_root, idx, self.ending))
+        os.replace(os.path.join(self.img_root, self.frame_name_list[idx]), '%s/%08.3f.%s' % (self.inter_root, idx, self.ending))
         # create empty mask
         cv2.imwrite('%s/%08.3f.%s' % (self.mask_root, self.index, self.ending), np.zeros(self.img_shape, dtype=np.uint8))
 
@@ -70,12 +71,14 @@ class Interpolater:
         return torch.nn.functional.grid_sample(input=tenInput, grid=(self.backwarp_tenGrid[str(tenFlow.shape)] + tenFlow).permute(0, 2, 3, 1), mode='bilinear', padding_mode='zeros', align_corners=False)
 
     def interpolate(self):
-        tenFirst = torch.FloatTensor(np.ascontiguousarray(cv2.imread(filename=self.frame_name_list[self.index],
-                                                                     flags=-1).transpose(2, 0, 1)[None, :, :, :].astype(np.float32) * (1.0 / 255.0))).to(self.device)
-        tenSecond = torch.FloatTensor(np.ascontiguousarray(cv2.imread(filename=self.frame_name_list[self.index+1],
-                                                                      flags=-1).transpose(2, 0, 1)[None, :, :, :].astype(np.float32) * (1.0 / 255.0))).to(self.device)
-        tenFlow = torch.FloatTensor(np.ascontiguousarray(self.read_flo(self.flows[self.index]).transpose(2, 0, 1)[None, :, :, :])).to(self.device)
-
+        assert os.path.exists(os.path.join(self.img_root, self.frame_name_list[self.index]))
+        assert os.path.exists(os.path.join(self.img_root, self.frame_name_list[self.index+1]))
+        tenFirst = torch.FloatTensor(np.ascontiguousarray(cv2.imread(filename=os.path.join(
+            self.img_root, self.frame_name_list[self.index]), flags=-1).transpose(2, 0, 1)[None, :, :, :].astype(np.float32) * (1.0 / 255.0))).to(self.device)
+        tenSecond = torch.FloatTensor(np.ascontiguousarray(cv2.imread(filename=os.path.join(
+            self.img_root, self.frame_name_list[self.index+1]), flags=-1).transpose(2, 0, 1)[None, :, :, :].astype(np.float32) * (1.0 / 255.0))).to(self.device)
+        tenFlow = torch.FloatTensor(np.ascontiguousarray(self.read_flo(os.path.join(self.flow_root, self.flows[self.index])).transpose(2, 1, 0)[None, :, :, :])).to(self.device)
+        #print(tenFirst.shape, tenSecond.shape, tenFlow.shape)
         tenMetric = torch.nn.functional.l1_loss(input=tenFirst, target=self.backwarp(tenInput=tenSecond, tenFlow=tenFlow), reduction='none').mean(1, True)
 
         for intTime, fltTime in enumerate(np.linspace(0, 1, self.steps+1, endpoint=False).tolist()[1:]):
