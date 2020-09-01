@@ -1,30 +1,29 @@
 
+import os, sys
+paths = [
+    r'PYTHON_PATH/site-packages',
+    os.path.dirname(os.path.realpath(__file__)),
+    r'C:\Users\user\Desktop\ML\CleanPlateBlender'
+]
+
+for p in paths:
+    sys.path.insert(0, p)
+from utils import io
+from tools import infer_liteflownet, frame_inpaint, propagation_inpaint, interpolate
+from models import LiteFlowNet, resnet_models
+from dataset import FlowInfer, data_list, FlowInitial
+import numpy as np
+from PIL import Image, ImageDraw
+import cvbase as cvb
+from geomdl import BSpline, utilities
+from torch.utils.data import DataLoader
+import torch
+import torch.nn as nn
+import cv2
 import bpy
 from bpy.types import Operator, Panel, PropertyGroup, WindowManager
 from bpy.props import PointerProperty, StringProperty, IntProperty, FloatProperty, BoolProperty, EnumProperty
-import sys
 import tempfile
-import os
-paths = [
-    r'C:\Users\user\AppData\Local\Continuum\anaconda3\lib\site-packages',
-    r'C:\Users\user\Desktop\ML\CleanPlateBlender',
-    #os.path.dirname(os.path.realpath(__file__))
-]
-for p in paths:
-    sys.path.insert(0, p)
-
-import cv2
-import torch.nn as nn
-import torch
-from torch.utils.data import DataLoader
-from geomdl import BSpline, utilities
-import cvbase as cvb
-from PIL import Image, ImageDraw
-import numpy as np
-from dataset import FlowInfer, data_list, FlowInitial
-from models import LiteFlowNet, resnet_models
-from tools import infer_liteflownet, frame_inpaint, propagation_inpaint
-from utils import io
 
 
 bl_info = {
@@ -57,35 +56,40 @@ class Settings(PropertyGroup):
     mask_name: EnumProperty(
         name="Mask",
         description="Which Mask to use for the inpainting",
-        items=mask_name_callback
+        items=mask_name_callback,
+        options=set()
     )
 
     mask_enlarge: IntProperty(
         name="Enlarge Mask",
         description="Enlarge the effective mask during inpainting",
         default=0,
-        min=0
+        min=0,
+        options=set()
     )
 
     n_threads: IntProperty(
         name="Threads",
         description="Number of threads",
         default=0,
-        min=0
+        min=0,
+        options=set()
     )
 
     th_warp: IntProperty(
         name="Threshold",
         description="Threshold in the propagation process",
         default=40,
-        min=1
+        min=1,
+        options=set()
     )
 
     batch_size: IntProperty(
         name="Batch size",
         description="How many frames to process at once\n (depends heavily on the GPU)",
         default=1,
-        min=1
+        min=1,
+        options=set()
     )
 
     outpath: StringProperty(
@@ -93,20 +97,31 @@ class Settings(PropertyGroup):
         description="Where to save the inpainted images",
         default=tempfile.gettempdir(),
         maxlen=1024,
-        subtype='DIR_PATH'
+        subtype='DIR_PATH',
+        options=set()
     )
 
     imgending: StringProperty(
         name="File Format",
         description="File Format for the inpainted images",
-        default='png'
+        default='png',
+        options=set()
     )
 
     downscale: FloatProperty(
         name="Downscaling Factor",
         description="How much to downscale the image",
         default=1,
-        min=1
+        min=1,
+        options=set()
+    )
+
+    steps: IntProperty(
+        name="Interpolation steps",
+        description="How many steps in between 2 frames to generate",
+        default=1,
+        min=0,
+        options=set()
     )
 
 
@@ -248,8 +263,10 @@ class CleanPlateMaker:
         self.args.img_root = os.path.join(self.tmp_dir.name, 'frames')
         self.args.mask_root = os.path.join(self.tmp_dir.name, 'masks')
         self.args.flow_root = os.path.join(self.tmp_dir.name, 'Flow')
+        self.args.inter_root = os.path.join(self.tmp_dir.name, 'interp')
         for d in (self.args.img_root, self.args.mask_root, self.args.flow_root):
             os.makedirs(d)
+        self.imgending = self.settings.imgending
         self.args.dataset_root = self.tmp_dir.name
         self.args.frame_dir = self.args.img_root
         self.args.pretrained_model_liteflownet = os.path.join(proj_dir, 'weights', 'liteflownet.pth')
@@ -263,6 +280,7 @@ class CleanPlateMaker:
         self.args.th_warp = self.settings.th_warp
         self.args.enlarge_mask = self.settings.mask_enlarge > 0
         self.args.enlarge_kernel = self.settings.mask_enlarge
+        self.interpolation_steps = self.settings.steps
         # Load Model
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.args.device = device
@@ -398,7 +416,7 @@ class CleanPlateMaker:
         self.wm.progress_end()
         self.tmp_dir.cleanup()
 
-    def cleanplate(self, context):
+    def execute(self, context):
         if self.state == -1:
             self.setup(context)
         elif self.state == 0:
@@ -410,6 +428,55 @@ class CleanPlateMaker:
         elif self.state == 3:
             self.propagation()
         elif self.state == 4:
+            self.state = -1
+            self.close()
+            return {'FINISHED'}
+        self.progress += 1
+        self.wm.progress_update(np.clip(self.progress, 0, 2+self.T*5))
+
+
+class FrameInterpolator(CleanPlateMaker):
+    def collect_next_frame(self):
+        self.i += 1
+        ret, frame = self.cap.read()
+        curr_frame = bpy.context.scene.frame_current
+        # state finished. return and go to next state
+        if not ret or curr_frame == self.frame_end+1:
+            self.cap.release()
+            bpy.ops.clip.change_frame(frame=self.frame_end)
+            self.i = -1
+            self.state += 1
+            return
+
+        frame = cv2.resize(frame, dsize=(self.W, self.H), interpolation=cv2.INTER_LINEAR)
+        cv2.imwrite(os.path.join(self.args.img_root, '%05d.%s' % (curr_frame, self.settings.imgending)), frame)
+
+        bpy.ops.clip.change_frame(frame=curr_frame+1)
+
+    def interpolate(self):
+        if self.i == -1:
+            self.interpolator = interpolate.Interpolater(self.args)
+        self.i += 1
+        if self.interpolator.step():
+            self.img_root = self.inter_root
+            self.i = -1
+            self.state += 1
+            del self.interpolator
+
+    def execute(self, context):
+        if self.state == -1:
+            self.setup(context)
+        elif self.state == 0:
+            self.collect_next_frame()
+        elif self.state == 1:
+            self.flow()
+        elif self.state == 2:
+            self.flow_completion()
+        elif self.state == 3:
+            self.interpolate()
+        elif self.state == 4:
+            self.propagation()
+        elif self.state == 5:
             self.state = -1
             self.close()
             return {'FINISHED'}
@@ -433,7 +500,7 @@ class OBJECT_OT_cleanplate(Operator):
             self._updating = True
             #frame_end = context.scene.frame_end
             # if bpy.context.scene.frame_current < frame_end:
-            ret = self.cpm.cleanplate(context)
+            ret = self.cpm.execute(context)
             if type(ret) == set:
                 self._calcs_done = True
 
@@ -465,8 +532,32 @@ class OBJECT_OT_cleanplate(Operator):
         return {'CANCELLED'}
 
 
+class PANEL0_PT_settings(Panel):
+    bl_label = "Settings"
+    bl_idname = "PANEL0_PT_settings"
+    bl_space_type = 'CLIP_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "CleanPlate"
+
+    @classmethod
+    def poll(cls, context):
+        return (context.area.spaces.active.clip is not None)
+
+    # Draw UI
+    def draw(self, context):
+        settings = context.scene.cp_settings
+        layout = self.layout
+        layout.use_property_split = True  # Active single-column layout
+        layout.prop(settings, 'downscale')
+        layout.prop(settings, 'imgending', icon='FILE_IMAGE')
+        layout.prop(settings, 'outpath')
+        #layout.prop(settings, 'n_threads')
+        #layout.prop(settings, 'batch_size')
+        layout.prop(settings, 'th_warp')
+
+
 class PANEL0_PT_cleanplate(Panel):
-    bl_label = "Mask Tracking"
+    bl_label = "Inpainting"
     bl_idname = "PANEL0_PT_cleanplate"
     bl_space_type = 'CLIP_EDITOR'
     bl_region_type = 'UI'
@@ -484,17 +575,83 @@ class PANEL0_PT_cleanplate(Panel):
         layout.prop(settings, 'mask_name')
         layout.prop(settings, 'downscale')
         layout.prop(settings, 'mask_enlarge')
-        layout.prop(settings, 'imgending', icon='FILE_IMAGE')
-        layout.prop(settings, 'outpath')
-        #layout.prop(settings, 'n_threads')
-        #layout.prop(settings, 'batch_size')
-        layout.prop(settings, 'th_warp')
         layout.separator()
         row = layout.row()
         row.operator("object.cleanplate", text="Create Clean Plate")
 
 
-classes = (OBJECT_OT_cleanplate, PANEL0_PT_cleanplate, Settings)
+
+class PANEL0_PT_interpolation(Panel):
+    bl_label = "Frame Interpolation"
+    bl_idname = "PANEL0_PT_interpolation"
+    bl_space_type = 'CLIP_EDITOR'
+    bl_region_type = 'UI'
+    bl_category = "CleanPlate"
+
+    @classmethod
+    def poll(cls, context):
+        return (context.area.spaces.active.clip is not None)
+
+    # Draw UI
+    def draw(self, context):
+        settings = context.scene.cp_settings
+        layout = self.layout
+        layout.use_property_split = True  # Active single-column layout
+        layout.prop(settings, 'steps')
+        layout.separator()
+        row = layout.row()
+        row.operator("object.interpolate", text="Generate New Frames")
+
+
+class OBJECT_OT_interpolation(Operator):
+    bl_idname = "object.interpolate"
+    bl_label = ""
+    bl_description = "Generates new frames in between existing frames"
+
+    _updating = False
+    _calcs_done = True
+    _timer = None
+
+    def modal(self, context, event):
+        if event.type in {'RIGHTMOUSE', 'ESC'}:
+            self._calcs_done = True
+        elif event.type == 'TIMER' and not self._updating and not self._calcs_done:
+            self._updating = True
+            #frame_end = context.scene.frame_end
+            # if bpy.context.scene.frame_current < frame_end:
+            ret = self.cpm.execute(context)
+            if type(ret) == set:
+                self._calcs_done = True
+
+            self._updating = False
+        if self._calcs_done:
+            self.cancel(context)
+        return {'PASS_THROUGH'}
+
+    def execute(self, context):
+        clip = context.space_data.clip
+        self.cpm = FrameInterpolator()
+        self.cpm.movpath = bpy.path.abspath(clip.filepath)
+        self.cpm.hw = clip.size
+        self.cpm.set_coordinate_transform()
+
+        self._calcs_done = False
+        context.window_manager.modal_handler_add(self)
+        self._updating = False
+        self._timer = context.window_manager.event_timer_add(.01, window=context.window)
+        return {'RUNNING_MODAL'}
+
+    def cancel(self, context):
+        if self._timer is not None:
+            context.window_manager.event_timer_remove(self._timer)
+            self._timer = None
+            if self.cpm.complete:
+                self.report({'INFO'}, "Inpainting complete.")
+            del self.cpm
+        return {'CANCELLED'}
+
+
+classes = (OBJECT_OT_cleanplate,PANEL0_PT_settings, PANEL0_PT_cleanplate, Settings, PANEL0_PT_interpolation, OBJECT_OT_interpolation)
 
 
 def register():

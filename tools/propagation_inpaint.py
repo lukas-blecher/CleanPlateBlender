@@ -61,7 +61,7 @@ class modal_propagation:
         self.state = 0
         self.index = [0, 0, 0]
         self.calls = [self.forward, self.backward, self.merge]
-        self.file_ending='png'
+        self.file_ending = args.imgending
 
     def __len__(self):
         return self.frames_num*3-3
